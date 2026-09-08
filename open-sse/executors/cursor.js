@@ -503,6 +503,14 @@ export class CursorExecutor extends BaseExecutor {
     const agentEndpoint = PROVIDER_OAUTH.cursor?.agentEndpoint;
     if (!agentEndpoint) throw new Error("Cursor AgentService endpoint is not configured");
 
+    // Cursor Auto / "default" often yields thinking-only frames on the legacy
+    // ChatService. Resolve the alias to a concrete upstream model here too —
+    // agent text requests (dashboard pings, Claude Code text turns) bypass
+    // transformRequest entirely.
+    const upstreamModel = resolveCursorUpstreamModel(model);
+    if (normalizeCursorModelId(model) !== upstreamModel) {
+      debugLog(`[CURSOR AGENT] Resolved ${normalizeCursorModelId(model)} → ${upstreamModel}`);
+    }
     const url = `${agentEndpoint}${AGENT_RUN_PATH}`;
     const headers = this.buildHeaders(credentials);
     const requestController = new AbortController();
@@ -513,7 +521,7 @@ export class CursorExecutor extends BaseExecutor {
     let session;
     try {
       session = this.openAgentHttp2Stream(url, headers, requestController.signal);
-      session.write(buildAgentRunFrame(body.messages || [], model));
+      session.write(buildAgentRunFrame(body.messages || [], upstreamModel));
     } catch (error) {
       throw new Error(`Cursor AgentService request failed: ${error.message}`);
     }
@@ -631,6 +639,26 @@ export class CursorExecutor extends BaseExecutor {
           responseFormat: FORMATS.OPENAI,
         };
       }
+      if (!content && !reasoning) {
+        // Surface an empty AgentService turn as an explicit error instead of a
+        // silent HTTP 200 with 0 output tokens (issue #1077).
+        return {
+          response: new Response(JSON.stringify({
+            error: {
+              message: `Cursor returned an empty completion for model ${model}`,
+              type: "api_error",
+              code: "empty_completion",
+            },
+          }), {
+            status: HTTP_STATUS.BAD_GATEWAY,
+            headers: { "Content-Type": "application/json" },
+          }),
+          url,
+          headers,
+          transformedBody: body,
+          responseFormat: FORMATS.OPENAI,
+        };
+      }
       return {
         response: new Response(JSON.stringify({
           id: responseId,
@@ -648,10 +676,12 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     const encoder = new TextEncoder();
+    let streamedText = false;
     const responseStream = new ReadableStream({
       start(controller) {
         consume((event) => {
           if (event.type === "text") {
+            streamedText = true;
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { content: event.value } })));
           } else if (event.type === "thinking") {
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: { reasoning_content: event.value } })));
@@ -663,6 +693,14 @@ export class CursorExecutor extends BaseExecutor {
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();
           } else if (event.type === "done") {
+            if (!streamedText) {
+              // Empty turn: no text events were ever emitted. Surface an SSE
+              // error frame instead of a silent empty 200 (issue #1077).
+              controller.enqueue(encoder.encode(sseChunk({ error: { message: `Cursor returned an empty completion for model ${model}`, type: "api_error", code: "empty_completion" } })));
+              controller.enqueue(encoder.encode(SSE_DONE));
+              controller.close();
+              return;
+            }
             controller.enqueue(encoder.encode(chatChunkSse({ id: responseId, created, model, delta: {}, finishReason: "stop" })));
             controller.enqueue(encoder.encode(SSE_DONE));
             controller.close();

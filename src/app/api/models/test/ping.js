@@ -1,6 +1,7 @@
 import { getApiKeys } from "@/lib/localDb";
 import { UPDATER_CONFIG } from "@/shared/constants/config";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
+import { parseSSEToOpenAIResponse } from "open-sse/handlers/chatCore/sseToJsonHandler.js";
 
 const CLI_TOKEN_SALT = "9r-cli-auth";
 
@@ -130,6 +131,7 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
     return { ok: true, latencyMs, error: null, status: res.status };
   }
 
+  const isCursorModel = /^(cu|cursor)\//i.test(model);
   const res = await fetch(`${baseUrl}/api/v1/chat/completions`, {
     method: "POST",
     headers,
@@ -140,7 +142,7 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
       // max_tokens:16 starves the answer and yields a false "no choices" failure.
       // See issue #3010.
       max_tokens: 1024,
-      stream: false,
+      stream: isCursorModel,
       messages: [{ role: "user", content: "hi" }],
     }),
     signal: AbortSignal.timeout(15000),
@@ -149,7 +151,11 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
 
   const rawText = await res.text().catch(() => "");
   let parsed = null;
-  try { parsed = rawText ? JSON.parse(rawText) : null; } catch {}
+  try {
+    parsed = isCursorModel && res.ok
+      ? parseSSEToOpenAIResponse(rawText, model)
+      : (rawText ? JSON.parse(rawText) : null);
+  } catch {}
 
   if (!res.ok) {
     const detail = parsed?.error?.message || parsed?.msg || parsed?.message || parsed?.error || rawText;
@@ -203,6 +209,18 @@ export async function pingModelByKind(model, kind, baseUrl = `http://127.0.0.1:$
       latencyMs,
       status: res.status,
       error: "Provider returned no completion choices for this model",
+    };
+  }
+
+  const message = parsed?.choices?.[0]?.message;
+  const hasContent = typeof message?.content === "string" && message.content.length > 0;
+  const hasToolCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+  if (!hasContent && !hasToolCalls && (isCursorModel || !hasReasoning)) {
+    return {
+      ok: false,
+      latencyMs,
+      status: res.status,
+      error: "Provider returned an empty completion for this model",
     };
   }
 
