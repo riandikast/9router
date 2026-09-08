@@ -1,0 +1,38 @@
+name: Build 9router Cursor Fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Cursor regression harness
+        run: node tests/manual-verify/cursor-default-verify.mjs
+
+      - name: Build CLI package
+        working-directory: cli
+        run: npm run pack:cli
+
+      - name: Upload 9router package
+        uses: actions/upload-artifact@v4
+        with:
+          name: 9router-cursor-fix
+          path: "*.tgz"
+          if-no-files-found: error
+          retention-days: 14
